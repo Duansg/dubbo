@@ -16,6 +16,19 @@
  */
 package org.apache.dubbo.registry.zookeeper;
 
+import java.io.IOException;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.api.CuratorWatcher;
+import org.apache.curator.x.discovery.ServiceCache;
+
 import org.apache.dubbo.common.URL;
 import org.apache.dubbo.common.function.ThrowableConsumer;
 import org.apache.dubbo.common.function.ThrowableFunction;
@@ -29,21 +42,10 @@ import org.apache.dubbo.registry.client.event.listener.ServiceInstancesChangedLi
 import org.apache.dubbo.rpc.RpcException;
 import org.apache.dubbo.rpc.model.ApplicationModel;
 
-import org.apache.curator.framework.CuratorFramework;
-import org.apache.curator.framework.api.CuratorWatcher;
-import org.apache.curator.x.discovery.ServiceCache;
-
-import java.io.IOException;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-
 import static org.apache.dubbo.common.constants.LoggerCodeConstants.REGISTRY_ZOOKEEPER_EXCEPTION;
 import static org.apache.dubbo.common.function.ThrowableFunction.execute;
 import static org.apache.dubbo.metadata.RevisionResolver.EMPTY_REVISION;
+import static org.apache.dubbo.registry.client.metadata.ServiceInstanceMetadataUtils.EXPORTED_SERVICES_REVISION_PROPERTY_NAME;
 import static org.apache.dubbo.registry.client.metadata.ServiceInstanceMetadataUtils.getExportedServicesRevision;
 import static org.apache.dubbo.registry.zookeeper.util.CuratorFrameworkUtils.build;
 import static org.apache.dubbo.registry.zookeeper.util.CuratorFrameworkUtils.buildCuratorFramework;
@@ -110,15 +112,28 @@ public class ZookeeperServiceDiscovery extends AbstractServiceDiscovery {
     }
 
     @Override
-    protected void doUpdate(ServiceInstance serviceInstance) throws RuntimeException {
-        if (!EMPTY_REVISION.equals(getExportedServicesRevision(serviceInstance))) {
-            reportMetadata(serviceInstance.getServiceMetadata());
+    protected void doUpdate(ServiceInstance oldServiceInstance, ServiceInstance newServiceInstance) throws RuntimeException {
+        if (EMPTY_REVISION.equals(getExportedServicesRevision(newServiceInstance))
+                || EMPTY_REVISION.equals(oldServiceInstance.getMetadata().get(EXPORTED_SERVICES_REVISION_PROPERTY_NAME))) {
+            super.doUpdate(oldServiceInstance, newServiceInstance);
+            return;
+        }
+
+        org.apache.curator.x.discovery.ServiceInstance<ZookeeperInstance> oldInstance = build(oldServiceInstance);
+        org.apache.curator.x.discovery.ServiceInstance<ZookeeperInstance> newInstance = build(newServiceInstance);
+        if (!Objects.equals(newInstance.getName(), oldInstance.getName()) ||
+                !Objects.equals(newInstance.getId(), oldInstance.getId())) {
+            // Ignore if id changed. Should unregister first.
+            super.doUpdate(oldServiceInstance, newServiceInstance);
+            return;
         }
 
         try {
-            serviceDiscovery.updateService(build(serviceInstance));
+            this.serviceInstance = newServiceInstance;
+            reportMetadata(newServiceInstance.getServiceMetadata());
+            serviceDiscovery.updateService(newInstance);
         } catch (Exception e) {
-            throw new RpcException(REGISTRY_EXCEPTION, "Failed register instance " + serviceInstance.toString(), e);
+            throw new RpcException(REGISTRY_EXCEPTION, "Failed register instance " + newServiceInstance.toString(), e);
         }
     }
 
@@ -134,7 +149,7 @@ public class ZookeeperServiceDiscovery extends AbstractServiceDiscovery {
 
     @Override
     public void addServiceInstancesChangedListener(ServiceInstancesChangedListener listener)
-        throws NullPointerException, IllegalArgumentException {
+            throws NullPointerException, IllegalArgumentException {
         // check if listener has already been added through another interface/service
         if (!instanceListeners.add(listener)) {
             return;
@@ -144,6 +159,9 @@ public class ZookeeperServiceDiscovery extends AbstractServiceDiscovery {
 
     @Override
     public void removeServiceInstancesChangedListener(ServiceInstancesChangedListener listener) throws IllegalArgumentException {
+        if (!instanceListeners.remove(listener)) {
+            return;
+        }
         listener.getServiceNames().forEach(serviceName -> {
             ZookeeperServiceDiscoveryChangeWatcher watcher = watcherCaches.get(serviceName);
             if (watcher != null) {
@@ -154,7 +172,7 @@ public class ZookeeperServiceDiscovery extends AbstractServiceDiscovery {
                         watcher.getCacheInstance().close();
                     } catch (IOException e) {
                         logger.error(REGISTRY_ZOOKEEPER_EXCEPTION, "curator stop watch failed", "",
-                            "Curator Stop service discovery watch failed. Service Name: " + serviceName);
+                                "Curator Stop service discovery watch failed. Service Name: " + serviceName);
                     }
                 }
             }
@@ -175,8 +193,8 @@ public class ZookeeperServiceDiscovery extends AbstractServiceDiscovery {
 
         ZookeeperServiceDiscoveryChangeWatcher watcher = watcherCaches.computeIfAbsent(serviceName, name -> {
             ServiceCache<ZookeeperInstance> serviceCache = serviceDiscovery.serviceCacheBuilder()
-                .name(name)
-                .build();
+                    .name(name)
+                    .build();
             ZookeeperServiceDiscoveryChangeWatcher newer = new ZookeeperServiceDiscoveryChangeWatcher(this, serviceCache, name, latch);
             serviceCache.addListener(newer);
 
